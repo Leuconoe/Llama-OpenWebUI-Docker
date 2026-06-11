@@ -1,0 +1,141 @@
+# ============================================================================
+# Local AI stack — llama.cpp server (GGUF + MTP, multi-GPU) + Open WebUI
+#
+#   llm         : llama.cpp llama-server. Serves a GGUF model over an
+#                 OpenAI-compatible API (/v1). Multi-GPU tensor-split + MTP
+#                 (Multi-Token Prediction) speculative decoding.
+#   open-webui  : Browser UI + multi-user accounts. Talks to llm over /v1.
+#   comfyui     : Image generation (opt-in: --profile comfyui).
+#
+# Why direct llama-server (not Unsloth Studio's auto-serve):
+#   Studio's auto GPU-fit loads big models onto a single GPU (OOM on 27B) and
+#   exposes no tensor-split control. Driving llama-server directly gives full
+#   control: --tensor-split (use all GPUs), --spec-type draft-mtp (MTP), ctx.
+#   Verified: Qwen3.6-27B-MTP UD-Q4_K_XL across 2x RTX 3090 → ~61 tok/s,
+#   MTP draft acceptance ~0.85.
+#
+# The `llm` service reuses the unsloth/unsloth image purely for its prebuilt
+# MTP-capable llama.cpp binary (already pulled; no Studio processes started).
+# ============================================================================
+
+name: local-ai
+
+services:
+  # --------------------------------------------------------------------------
+  # llama.cpp server — GGUF inference backend (multi-GPU + MTP), OpenAI /v1
+  # --------------------------------------------------------------------------
+  llm:
+    image: unsloth/unsloth:latest
+    container_name: llm
+    pull_policy: always
+    restart: unless-stopped
+    # GPU via nvidia runtime (requires: nvidia-ctk runtime configure --runtime=docker).
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${LLM_GPUS:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # User-managed model cache (HF hub). Download models here. (req #1, #5)
+      - ./volume/models:/workspace/.cache/huggingface
+    ports:
+      - "${LLM_PORT:-8010}:8000"   # host -> container OpenAI API (/v1)
+    # Multi-GPU all-reduce needs shared memory + host IPC.
+    shm_size: "16gb"
+    ipc: host
+    # Run llama-server directly (skip the image's Studio/supervisord entrypoint).
+    # Resolve the GGUF from the HF cache by repo dir + quant glob (snapshot-hash agnostic).
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - 'GGUF=$$(find /workspace/.cache/huggingface/hub -path "*${MODEL_HUB:-models--unsloth--Qwen3.6-27B-MTP-GGUF}*" -name "${MODEL_GLOB:-*Q4_K_XL.gguf}" | head -1); echo "[llm] model=$$GGUF"; test -n "$$GGUF" || { echo "[llm] ERROR: no GGUF under MODEL_HUB=${MODEL_HUB:-models--unsloth--Qwen3.6-27B-MTP-GGUF}; download into ./volume/models first"; exit 1; }; exec /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server -m "$$GGUF" -ngl 99 --tensor-split ${LLM_TENSOR_SPLIT:-1,1} -c ${LLM_CTX:-32768} --flash-attn on --cache-type-k ${LLM_CACHE_TYPE:-f16} --cache-type-v ${LLM_CACHE_TYPE:-f16} --spec-type draft-mtp --spec-draft-n-max 2 --jinja --api-key ${LLM_API_KEY:-sk-local} --host 0.0.0.0 --port 8000'
+    healthcheck:
+      # llama-server /health is public (no key). Model load can take a while.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # --------------------------------------------------------------------------
+  # Open WebUI — frontend + account management
+  # --------------------------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      llm:
+        condition: service_started
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    environment:
+      - "OPENAI_API_BASE_URL=http://llm:8000/v1"
+      - "OPENAI_API_KEY=${LLM_API_KEY:-sk-local}"
+      - "ENABLE_OLLAMA_API=false"
+      - "WEBUI_AUTH=true"
+      - "WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-this-to-a-strong-secret}"
+      - "CORS_ALLOW_ORIGIN=*"
+      # --- Enforced default settings (env wins over DB) ---
+      # PersistentConfig vars below only apply if env is authoritative:
+      - "ENABLE_PERSISTENT_CONFIG=false"
+      - "DEFAULT_USER_ROLE=user"               # 1) 신규 사용자 즉시 'user'
+      - "ENABLE_SIGNUP=true"                   # 2) 회원가입 허용
+      - "BYPASS_MODEL_ACCESS_CONTROL=true"     # 3) 모든 모델을 전 사용자에게 공개
+      - "WEB_SEARCH_ENGINE=duckduckgo"         # 6) DDGS
+      - "BYPASS_EMBEDDING_AND_RETRIEVAL=true"  # 웹검색 결과 원문 직접 주입(소형 모델에 유리)
+      - "ENABLE_EVALUATION_ARENA_MODELS=false" # 평가 - Arena 모델 비활성
+      # 보조 생성 OFF — 본 답변과 동시에 모델을 점유해 속도를 떨어뜨리는 백그라운드 요청 제거
+      - "ENABLE_TAGS_GENERATION=false"
+      - "ENABLE_FOLLOW_UP_GENERATION=false"
+      - "ENABLE_AUTOCOMPLETE_GENERATION=false"
+      - "ENABLE_RETRIEVAL_QUERY_GENERATION=false"
+    volumes:
+      # Users, settings, chats — survives container delete/recreate. (req #4, #5)
+      - ./volume/open-webui:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # --------------------------------------------------------------------------
+  # ComfyUI — image generation (opt-in): docker compose --profile comfyui up -d
+  # Pinned to GPU 1. If running alongside a 2-GPU LLM, set LLM_TENSOR_SPLIT and
+  # LLM NVIDIA_VISIBLE_DEVICES to avoid contention.
+  # --------------------------------------------------------------------------
+  comfyui:
+    image: smyshnikof/comfyui:full-torch2.8.0-cu130
+    container_name: comfyui
+    profiles: ["comfyui"]
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    ports:
+      - "${COMFYUI_PORT:-8188}:3000"
+    volumes:
+      - ./volume/comfyui/models:/workspace/ComfyUI/models
+      - ./volume/comfyui/output:/workspace/ComfyUI/output
+      - ./volume/comfyui/user:/workspace/ComfyUI/user/default
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/system_stats || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

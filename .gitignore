@@ -1,0 +1,25 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# volume data (user/model/state) — keep dirs via .gitkeep, ignore contents
+volume/models/*
+!volume/models/.gitkeep
+volume/open-webui/*
+!volume/open-webui/.gitkeep
+volume/comfyui/models/*
+!volume/comfyui/models/.gitkeep
+volume/comfyui/output/*
+!volume/comfyui/output/.gitkeep
+volume/comfyui/user/*
+!volume/comfyui/user/.gitkeep
+
+# bkit plugin state
+.bkit/
+
+# legacy reference (do not commit)
+docker-compose.yml.bak
